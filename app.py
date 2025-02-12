@@ -303,6 +303,11 @@ def main():
                 "password": "123",
                 "email": "gpalacios1019@protonmail.com",
             },
+            "arodi": {
+                "name": "Arodi",
+                "password": "12345",
+                "email": "gpalacios1019@protonmail.com",
+            },
         }
     }
 
