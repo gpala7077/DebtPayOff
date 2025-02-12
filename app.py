@@ -27,7 +27,8 @@ def load_user_data():
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
         return data
-    except:
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
         return {}
 
 def save_user_data(user_data):
@@ -55,7 +56,7 @@ def initialize_user_session(username):
         }
         save_user_data(all_users_data)
 
-    # Load user data into session
+    # Load user data into session_state
     user_dict = all_users_data[username]
     st.session_state["username"] = username
     st.session_state["cards"] = user_dict.get("cards", [])
@@ -106,27 +107,37 @@ def apply_lump_sums(balance, lumpsum_list, current_month):
     return new_balance, lumpsum_applied
 
 def get_next_card_index(cards, method):
+    """
+    Returns the index of the card that should receive the extra payment.
+    For Avalanche, selects the highest APR; for Snowball, the smallest balance;
+    for Custom, orders based on a user-defined list; for Minimum, no extra payment is applied.
+    """
     non_zero_cards = [(i, c) for i, c in enumerate(cards) if c["balance"] > 0]
     if not non_zero_cards:
         return None
 
     if method == "Avalanche":
-        # Sort by APR desc
+        # Sort by APR descending (highest interest first)
         non_zero_cards.sort(key=lambda x: x[1]["apr"], reverse=True)
     elif method == "Snowball":
-        # Sort by balance asc
+        # Sort by balance ascending (smallest balance first)
         non_zero_cards.sort(key=lambda x: x[1]["balance"])
     elif method == "Custom":
         # Sort by custom priority in st.session_state["custom_order"]
         order_map = {name: i for i, name in enumerate(st.session_state.get("custom_order", []))}
         non_zero_cards.sort(key=lambda x: order_map.get(x[1]["name"], 999999))
     else:
-        # "Minimum" - no extra payment
+        # "Minimum" method uses only minimum payments
         return None
 
     return non_zero_cards[0][0]
 
 def simulate_debt_payoff(cards_data, monthly_budget, lumpsum_data, method, extra_payment=0.0):
+    """
+    Simulate a month-by-month debt repayment schedule.
+    Returns a DataFrame with month, remaining balance, interest, principal, and a breakdown of payments.
+    """
+    # Make a copy of the cards so the simulation doesn't affect the original data
     cards = []
     for c in cards_data:
         cards.append({
@@ -137,6 +148,7 @@ def simulate_debt_payoff(cards_data, monthly_budget, lumpsum_data, method, extra
             "limit": c["limit"]
         })
 
+    # Sort lump sum payments by scheduled month
     lumpsums = lumpsum_data[:]
     lumpsums.sort(key=lambda x: x["month"])
 
@@ -146,76 +158,69 @@ def simulate_debt_payoff(cards_data, monthly_budget, lumpsum_data, method, extra
 
     while total_balance > 0:
         row = {"Month": month}
-        monthly_interest_paid = 0
-        monthly_principal_paid = 0
         monthly_payments_breakdown = {}
 
-        # Calculate monthly interest for each card
-        for card in cards:
-            if card["balance"] > 0:
-                interest = calculate_interest(card["balance"], card["apr"])
-                monthly_interest_paid += interest
-
-        # Total min payments
+        # Calculate minimum payment requirement for active cards
         total_min_payments = sum(card["min_payment"] for card in cards if card["balance"] > 0)
-
-        # If monthly_budget < total_min_payments, clamp it
         if monthly_budget < total_min_payments:
             total_min_payments = monthly_budget
 
+        # Calculate extra funds available beyond minimum payments
         leftover_for_extra = max(
             0,
             monthly_budget - total_min_payments + (extra_payment if method != "Minimum" else 0.0)
         )
 
-        # Pay each card's minimum
+        # First, pay each card's minimum payment
+        principal_paid = 0.0
         for card in cards:
             if card["balance"] > 0:
                 payment = min(card["balance"], card["min_payment"])
                 card["balance"] -= payment
-                monthly_principal_paid += payment
+                principal_paid += payment
                 monthly_payments_breakdown[card["name"]] = monthly_payments_breakdown.get(card["name"], 0) + payment
 
-        # Apply leftover_for_extra
+        # Apply extra payment based on selected strategy
         card_index = get_next_card_index(cards, method)
         if card_index is not None and leftover_for_extra > 0:
             extra_pay = min(cards[card_index]["balance"], leftover_for_extra)
             cards[card_index]["balance"] -= extra_pay
-            monthly_principal_paid += extra_pay
+            principal_paid += extra_pay
             monthly_payments_breakdown[cards[card_index]["name"]] += extra_pay
 
-        # Apply monthly interest
-        total_interest_for_this_month = 0
+        # Compute and add monthly interest for each card
+        total_interest_this_month = 0.0
         for card in cards:
             if card["balance"] > 0:
                 interest = calculate_interest(card["balance"], card["apr"])
                 card["balance"] += interest
-                total_interest_for_this_month += interest
-        monthly_interest_paid = total_interest_for_this_month
+                total_interest_this_month += interest
 
-        # Apply lumpsum if scheduled
+        # Apply any lump sum payments scheduled for this month
         for card in cards:
             if card["balance"] > 0:
                 new_balance, lumpsum_applied = apply_lump_sums(card["balance"], lumpsums, month)
                 if lumpsum_applied > 0:
-                    monthly_payments_breakdown[card["name"]] += lumpsum_applied
+                    monthly_payments_breakdown[card["name"]] = monthly_payments_breakdown.get(card["name"], 0) + lumpsum_applied
                 card["balance"] = new_balance
 
         total_balance = sum([c["balance"] for c in cards if c["balance"] > 0])
-
         row["Total Balance"] = total_balance
-        row["Interest Paid"] = monthly_interest_paid
-        row["Principal Paid"] = monthly_principal_paid
+        row["Interest Paid"] = total_interest_this_month
+        row["Principal Paid"] = principal_paid
         row["Monthly Breakdown"] = dict(monthly_payments_breakdown)
-
         records.append(row)
         month += 1
-        if month > 600:  # safety limit
+
+        if month > 600:  # safety limit in case of extremely long payoff schedules
             break
 
     return pd.DataFrame(records)
 
 def generate_summary(df):
+    """
+    Generate a summary of the simulation results.
+    """
     if df.empty:
         return {
             "Total Months": 0,
@@ -229,13 +234,16 @@ def generate_summary(df):
     }
 
 ########################################
-# PDF Export
+# PDF Export Functionality
 ########################################
 
 class PDFReport(FPDF):
     pass
 
 def create_pdf_report(df_list, method_list, summary_list):
+    """
+    Create a consolidated PDF report that includes a summary comparison and details for each method.
+    """
     pdf = PDFReport()
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
@@ -259,7 +267,7 @@ def create_pdf_report(df_list, method_list, summary_list):
         pdf.cell(col_width, 10, f"${round(summ['Total Interest Paid'], 2)}", border=1)
         pdf.ln(10)
 
-    # Add each method’s detail
+    # Add each method’s detailed monthly breakdown on separate pages
     for method_name, df in zip(method_list, df_list):
         pdf.add_page()
         pdf.set_font("Arial", "B", 14)
@@ -285,72 +293,79 @@ def create_pdf_report(df_list, method_list, summary_list):
 ########################################
 
 def main():
-    st.title("Interactive Debt Payoff Calculator (Multi-User)")
-    st.write("Analyze and compare various strategies to pay off credit card debt. Now with user authentication.")
-
-    #
-    # 1. Credentials with Pre-Hashed Passwords
-    #
-    # Below are example hashed passwords for "123" and "456" created offline.
-    # Replace with your own hashed passwords as needed.
-    hashed_pw_john = "$2b$12$ZgshxJF6/wQ6QEpyxi/LBOVpONnBoFAD8F8Xu6MRxkz2cHBWIl7xy"  # "123"
-    hashed_pw_jane = "$2b$12$SBCf/BQNzm9Dp0gXk4OPYO/NvbfDh2TgehrGdDlNDmg1LomFaFaTS"  # "456"
+    st.title("Interactive Debt Payoff Calculator")
+    st.write("Analyze and compare various strategies to pay off your credit card debt with dynamic simulations and visual insights.")
 
     credentials = {
         "usernames": {
-            "john": {
-                "name": "John",
-                "password": hashed_pw_john
+            "gpalacios": {
+                "name": "Gerardo",
+                "password": "123",
+                "email": "gpalacios1019@protonmail.com",
             },
-            "jane": {
-                "name": "Jane",
-                "password": hashed_pw_jane
-            }
         }
     }
 
     authenticator = stauth.Authenticate(
         credentials,
         "my_app_cookie_name",  # Cookie name
-        "my_signature_key",    # Signature key/secret (should be a secure random string)
+        "my_signature_key",    # Signature key/secret (choose a secure random string)
         cookie_expiry_days=30
     )
 
-    name, authentication_status, username = authenticator.login("Login", "main")
+    authenticator.login(
+        location="main",
+        fields={
+            'Form name':'Login to Clear Debt',
+            'Username':'Username',
+            'Password':'Password',
+            'Login':'Login',
+        }
+    )
 
-    if authentication_status is False:
-        st.error("Username/password is incorrect")
-        return
-    elif authentication_status is None:
-        st.warning("Please enter your username and password")
-        return
-    else:
-        st.sidebar.write(f"Welcome, **{name}**")
-        logout_button = authenticator.logout("Logout", "sidebar")
+    if st.session_state["authentication_status"] is False:
+        st.warning("Username/password is incorrect")
+        st.stop()
 
-        if "username" not in st.session_state:
-            initialize_user_session(username)
+    elif st.session_state["authentication_status"] is None:
+        st.warning("Please enter your username and password.")
+        st.stop()
 
-        # Once logged in, run the main debt app
-        run_debt_app()
+    st.sidebar.write(f"Welcome, **{st.session_state['name']}**")
+    logout_button = authenticator.logout("Logout", "sidebar")
 
-        # If user logs out, persist data, then clear session
-        if logout_button:
-            persist_user_session()
-            st.session_state.clear()
+    if "username" not in st.session_state:
+        initialize_user_session(username)
+
+    # Run the main debt calculator app once the user is authenticated
+    run_debt_app()
+
+    # On logout, persist user data and clear the session
+    if logout_button:
+        persist_user_session()
+        st.session_state.clear()
 
 def run_debt_app():
     """
-    Same debt payoff logic as before, but using st.session_state for the logged-in user.
+    Main application: input forms, simulation, and comparisons.
+    Uses st.session_state for the logged-in user's data.
     """
+    st.session_state["cards"] = []
+    st.session_state["monthly_income"] = 1000000.00
+    st.session_state["fixed_expenses"] = 500.00
+    st.session_state["variable_expenses"] = 500.00
+    st.session_state["lump_sums"] = []
+    st.session_state['custom_order'] = []
+
+
     st.subheader("1. Credit Card Information")
     with st.expander("Add / Manage Credit Cards", expanded=True):
-        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
-        new_name = c1.text_input("Credit Card Name", "")
-        new_balance = c2.number_input("Current Balance", 0.0, 1e9, 0.0, 100.0)
-        new_apr = c3.number_input("APR (%)", 0.0, 100.0, 15.0, 0.1)
-        new_min_payment = c4.number_input("Minimum Payment", 0.0, 1e9, 50.0, 10.0)
-        new_limit = c5.number_input("Credit Limit", 0.0, 1e9, 5000.0, 100.0)
+        col1, col2, col3, col4, col5 = st.columns(5)
+        new_name = col1.text_input("Credit Card Name", "")
+        new_balance = col2.number_input("Current Balance", 0.0, 1e9, 0.0, step=100.0)
+        new_apr = col3.number_input("APR (%)", 0.0, 100.0, 15.0, step=0.1)
+        new_min_payment = col4.number_input("Minimum Payment", 0.0, 1e9, 50.0, step=10.0)
+        new_limit = col5.number_input("Credit Limit", 0.0, 1e9, 5000.0, step=100.0)
 
         if st.button("Add Credit Card"):
             if new_name.strip() == "":
@@ -368,10 +383,10 @@ def run_debt_app():
         if st.session_state["cards"]:
             st.write("**Current Credit Cards**")
             for i, card in enumerate(st.session_state["cards"]):
-                col1, col2, col3 = st.columns([4, 4, 1])
-                col1.write(f"**{card['name']}** - Balance: ${card['balance']:.2f}, APR: {card['apr']}%")
-                col2.write(f"Min Payment: ${card['min_payment']:.2f}, Limit: ${card['limit']:.2f}")
-                if col3.button("Remove", key=f"rm_{i}"):
+                colA, colB, colC = st.columns([4, 4, 1])
+                colA.write(f"**{card['name']}** - Balance: ${card['balance']:.2f}, APR: {card['apr']}%")
+                colB.write(f"Min Payment: ${card['min_payment']:.2f}, Limit: ${card['limit']:.2f}")
+                if colC.button("Remove", key=f"rm_{i}"):
                     st.session_state["cards"].pop(i)
                     st.experimental_rerun()
         else:
@@ -381,15 +396,15 @@ def run_debt_app():
     with st.expander("Enter Your Budget Details", expanded=True):
         st.session_state["monthly_income"] = st.number_input(
             "Monthly Income",
-            0.0, 1e9, st.session_state["monthly_income"], 100.0
+            0.0, 1e9, st.session_state["monthly_income"], step=100.0
         )
         st.session_state["fixed_expenses"] = st.number_input(
             "Total Fixed Expenses",
-            0.0, 1e9, st.session_state["fixed_expenses"], 50.0
+            0.0, 1e9, st.session_state["fixed_expenses"], step=50.0
         )
         st.session_state["variable_expenses"] = st.number_input(
             "Total Variable Expenses",
-            0.0, 1e9, st.session_state["variable_expenses"], 50.0
+            0.0, 1e9, st.session_state["variable_expenses"], step=50.0
         )
 
         disposable_income = compute_disposable_income(
@@ -402,8 +417,8 @@ def run_debt_app():
     st.subheader("3. Lump Sum Payments")
     with st.expander("Schedule Lump Sum Payments", expanded=False):
         lump_col1, lump_col2, lump_col3 = st.columns([2, 2, 2])
-        lump_month = lump_col1.number_input("Month Number (1-based)", 1, 360, 1, 1)
-        lump_amount = lump_col2.number_input("Lump Sum Amount", 0.0, 1e9, 0.0, 100.0)
+        lump_month = lump_col1.number_input("Month Number (1-based)", 1, 360, 1, step=1)
+        lump_amount = lump_col2.number_input("Lump Sum Amount", 0.0, 1e9, 0.0, step=50.0)
         lump_desc = lump_col3.text_input("Description", "")
 
         if st.button("Add Lump Sum"):
@@ -432,8 +447,7 @@ def run_debt_app():
     st.subheader("4. Debt Repayment Strategy & Parameters")
     strategy_options = ["Minimum", "Snowball", "Avalanche", "Custom"]
     chosen_strategy = st.selectbox("Choose your primary repayment strategy", strategy_options)
-
-    extra_payment = st.number_input("Extra Monthly Payment (beyond total minimums)", 0.0, 1e9, 0.0, 10.0)
+    extra_payment = st.number_input("Extra Monthly Payment (beyond total minimums)", 0.0, 1e9, 0.0, step=10.0)
 
     if chosen_strategy == "Custom":
         st.write("**Set your own priority order for repayment**")
@@ -460,6 +474,7 @@ def run_debt_app():
                 st.session_state["variable_expenses"]
             )
 
+            # Run simulation for each repayment strategy
             for m in sim_methods:
                 df_result = simulate_debt_payoff(
                     st.session_state["cards"],
@@ -481,6 +496,7 @@ def run_debt_app():
             df_chosen = results[method_choice]
 
             if not df_chosen.empty:
+                # Prepare data for Altair visualization
                 df_plot = df_chosen[["Month", "Total Balance", "Interest Paid", "Principal Paid"]].melt("Month")
                 chart = alt.Chart(df_plot).mark_line(point=True).encode(
                     x="Month:Q",
@@ -505,7 +521,7 @@ def run_debt_app():
                     mime="text/csv"
                 )
             else:
-                st.info("No data for this method.")
+                st.info("No data available for this method.")
 
             if st.button("Generate Consolidated PDF Report"):
                 pdf = create_pdf_report(
@@ -525,7 +541,7 @@ def run_debt_app():
     else:
         st.info("Click 'Run Simulation' to calculate and compare repayment strategies.")
 
-    # Persist user’s data if anything changed
+    # Persist user data to file
     persist_user_session()
 
 if __name__ == "__main__":
